@@ -1,0 +1,205 @@
+# docker-compose.yml — TP Final Multi-WAN
+#
+# FIXES aplicados respecto a la versión anterior:
+#  1. Cada red declara gateway .254 para Docker → los contenedores pueden usar las .1
+#     (antes Docker se reservaba la .1 y chocaba con nuestras IPs estáticas).
+#  2. wan1/wan2-gateway ahora tienen ip_forward habilitado (rutean, lo necesitan).
+#  3. SYS_MODULE eliminado del orchestrator: cargar módulos de kernel desde un
+#     contenedor es mala práctica y no funciona en Docker Desktop. Los módulos
+#     (nf_conntrack, xt_mark, iptable_mangle) se cargan en el HOST:
+#       sudo modprobe nf_conntrack xt_mark iptable_mangle iptable_nat
+#  4. Healthcheck en orchestrator + depends_on condition en cliente-pyme:
+#     el cliente no genera tráfico hasta que las rutas existen.
+
+# version: "3.9"   # DEPRECADO: Compose v2 ignora esta clave y emite warning. No usar.
+
+networks:
+  pyme-lan:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.10.0/24
+          gateway: 192.168.10.254
+  wan1-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.16.1.0/24
+          gateway: 172.16.1.254
+  wan2-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.16.2.0/24
+          gateway: 172.16.2.254
+  internet-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.16.10.0/24
+          gateway: 172.16.10.254
+
+volumes:
+  sqlite-data:
+  prometheus-data:
+  logs-data:
+  ml-models:
+
+services:
+  orchestrator:
+    build:
+      context: ./orchestrator
+    container_name: orchestrator
+    hostname: orchestrator
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      # - SYS_MODULE   # ELIMINADO: mala práctica; los módulos se cargan en el host.
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    networks:
+      pyme-lan:
+        ipv4_address: 192.168.10.1
+      wan1-net:
+        ipv4_address: 172.16.1.2
+      wan2-net:
+        ipv4_address: 172.16.2.2
+    volumes:
+      - sqlite-data:/data
+      - logs-data:/logs
+      - ml-models:/models
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      CONFIG_PATH: /app/config.yaml
+      DB_PATH: /data/orchestrator.db
+      LOG_PATH: /logs
+      MODELS_PATH: /models
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8080/health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    depends_on:
+      - wan1-gateway
+      - wan2-gateway
+
+  wan1-gateway:
+    build:
+      context: ./wan-gateway
+    container_name: wan1-gateway
+    hostname: wan1-gateway
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    sysctls:                      # FIX: los gateways rutean → necesitan forwarding
+      net.ipv4.ip_forward: "1"
+    networks:
+      wan1-net:
+        ipv4_address: 172.16.1.1
+      internet-net:
+        ipv4_address: 172.16.10.1
+    environment:
+      WAN_ID: wan1
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "9001:9001"
+
+  wan2-gateway:
+    build:
+      context: ./wan-gateway
+    container_name: wan2-gateway
+    hostname: wan2-gateway
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    networks:
+      wan2-net:
+        ipv4_address: 172.16.2.1
+      internet-net:
+        ipv4_address: 172.16.10.2
+    environment:
+      WAN_ID: wan2
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "9002:9001"
+
+  cliente-pyme:
+    build:
+      context: ./client-pyme
+    container_name: cliente-pyme
+    hostname: cliente-pyme
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN            # necesario para apuntar su default route al orquestador
+    networks:
+      pyme-lan:
+        ipv4_address: 192.168.10.10
+    environment:
+      GATEWAY_IP: "192.168.10.1"
+      EXTERNAL_HTTP: "http://172.16.10.100:8000"
+      EXTERNAL_VOIP_HOST: "172.16.10.100"
+      EXTERNAL_BULK_HOST: "172.16.10.100"
+      EXTERNAL_BULK_PORT: "9000"
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      orchestrator:
+        condition: service_healthy   # no arranca hasta que el orquestador esté listo
+      servidor-externo:
+        condition: service_started
+
+  servidor-externo:
+    build:
+      context: ./external-server
+    container_name: servidor-externo
+    hostname: servidor-externo
+    restart: unless-stopped
+    networks:
+      internet-net:
+        ipv4_address: 172.16.10.100
+    environment:
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8000:8000"
+
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: prometheus
+    hostname: prometheus
+    restart: unless-stopped
+    networks:
+      pyme-lan:
+        ipv4_address: 192.168.10.20
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+    ports:
+      - "9090:9090"
+
+  dashboard:
+    build:
+      context: ./dashboard
+    container_name: dashboard
+    hostname: dashboard
+    restart: unless-stopped
+    networks:
+      pyme-lan:
+        ipv4_address: 192.168.10.30
+    ports:
+      - "3000:80"
+    depends_on:
+      - orchestrator

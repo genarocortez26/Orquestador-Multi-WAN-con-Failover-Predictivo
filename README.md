@@ -2,7 +2,7 @@
 
 Plano de control que reparte el tráfico de una PyME entre dos enlaces WAN según **la clase de cada flujo** y la calidad medida de cada enlace, con failover reactivo y un modelo de detección de anomalías que anticipa la degradación antes de que cruce los umbrales.
 
-Stack: Python (FastAPI, asyncio, scikit-learn) · Linux policy-based routing (iptables, conntrack, ip rule) · Docker Compose · Prometheus
+Stack: Python (FastAPI, asyncio, scikit-learn) · Linux policy-based routing (iptables, conntrack, ip rule) · React + TypeScript · Docker Compose · Prometheus
 
 ---
 
@@ -32,7 +32,7 @@ Este orquestador ataca las dos: decide **por flujo** según política, y usa la 
       Prometheus + API
 ```
 
-Seis contenedores sobre cuatro redes bridge separadas, simulando LAN, dos enlaces WAN e internet. El cliente genera tráfico VoIP, web y bulk contra el servidor externo.
+Siete contenedores sobre cuatro redes bridge separadas, simulando LAN, dos enlaces WAN e internet. El cliente genera tráfico VoIP, web y bulk contra el servidor externo.
 
 **El plano de datos no pasa por Python.** El orquestador solo configura reglas: tablas de routing por WAN, `ip rule` por fwmark, y `CONNMARK --restore-mark` para que el kernel enrute cada paquete por donde corresponde. Ningún paquete atraviesa el proceso. Eso mantiene el throughput en el kernel y limita al orquestador al plano de control.
 
@@ -64,6 +64,18 @@ El umbral no se eligió a ojo. `train_model.py` imprime la distribución de scor
 
 **El ML es un diferenciador, no una dependencia.** Si no hay modelo en `/models`, el predictor se desactiva con un log claro y el sistema sigue funcionando con failover reactivo. Preferí eso a que el orquestador no arranque por falta de un `.pkl`.
 
+## Dashboard
+
+React 18 + TypeScript sobre Vite, servido por nginx, con estado en zustand y gráficos en recharts. Cuatro vistas: estado de los WAN en vivo, tabla de flujos activos, línea de tiempo de eventos y visor de logs. Las métricas llegan por WebSocket, así que la migración de un flujo se ve en el momento en que ocurre.
+
+Para demostrarlo no hace falta esperar a que un enlace se caiga solo: los gateways exponen una API de degradación que inyecta latencia y pérdida con `tc`.
+
+```bash
+curl -X POST localhost:9001/degrade -d '{"latency_ms": 120, "loss_pct": 5}'
+curl -X POST localhost:9001/down
+curl -X POST localhost:9001/restore
+```
+
 ## Cómo correrlo
 
 En el host, antes de levantar (los módulos de kernel no se cargan desde un contenedor):
@@ -80,7 +92,8 @@ docker compose exec orchestrator python train_model.py
 docker compose restart orchestrator
 ```
 
-- API y estado: `http://localhost:8080`
+- Dashboard: `http://localhost:3000`
+- API: `http://localhost:8080`
 - Prometheus: `http://localhost:9090`
 
 Requiere Linux con esos módulos disponibles. En Docker Desktop sobre macOS o Windows el marcado de conexiones no funciona igual.
@@ -103,6 +116,7 @@ Todos los comandos externos se invocan con lista de argumentos, nunca con `shell
 - **El modelo aprende degradaciones sintéticas**, generadas por `train_model.py`, no capturas de enlaces reales. Es lo que permite entrenar sin montar un laboratorio, pero significa que las anomalías que detecta son las que se le enseñaron.
 - **Dos WANs.** El diseño escala a N por configuración, pero solo se probó con dos.
 - **Clasificación por puerto.** No hay inspección de protocolo, así que VoIP en puertos no estándar cae en `other`.
+- **El editor de políticas del dashboard es de solo lectura en la práctica.** La pantalla carga y muestra los pesos, pero el botón de guardar llama a `PUT /api/policies/{clase}`, que todavía no existe en la API. Las políticas se editan en `config.yaml`.
 - **La migración preventiva solo mueve flujos VoIP.** Es la clase que más sufre la degradación, pero es una decisión de alcance, no un límite técnico.
 
 ## Contexto

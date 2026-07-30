@@ -1,0 +1,104 @@
+# config.yaml — configuración única del orquestador (fuente de verdad, RNF: sin hardcodeo)
+
+orchestrator:
+  lan_ip: "192.168.10.1"          # IP del orquestador en la LAN (para detectar la interfaz)
+  poll_interval_seconds: 1
+  poll_window_latency: 10          # ventana móvil para RTT/jitter
+  poll_window_loss: 20             # ventana móvil para pérdida
+  flow_poll_interval_seconds: 1    # frecuencia de escaneo de conntrack
+  # flow_cleanup_interval_seconds: 30   # ELIMINADO: el escaneo de conntrack ya refleja
+  # flow_timeout_seconds: 300           # los flujos vivos; no hace falta GC propio.
+
+wans:
+  - id: wan1
+    name: "WAN 1 - Fibra"
+    gateway: "172.16.1.1"
+    # interface: eth1   # ELIMINADO: el nombre de interfaz en Docker no es determinístico.
+    #                   # El orquestador la detecta en runtime por subred del gateway.
+    monitor_targets:
+      - "172.16.10.100"
+    cost: 1.0
+    routing_table: 100
+    fwmark: 1
+
+  - id: wan2
+    name: "WAN 2 - Cable"
+    gateway: "172.16.2.1"
+    monitor_targets:
+      - "172.16.10.100"
+    cost: 0.8
+    routing_table: 200
+    fwmark: 2
+
+thresholds:
+  hard_down_loss_pct: 80.0
+  hard_down_consecutive_timeouts: 5
+  degraded_latency_ms: 150.0
+  degraded_loss_pct: 5.0
+  degraded_jitter_ms: 20.0
+  recovery_hysteresis_seconds: 10
+
+policies:
+  - name: voip
+    traffic_class: voip
+    weights: { latency: 0.40, jitter: 0.40, loss: 0.15, cost: 0.05 }
+    hard_limits: { max_loss_pct: 2.0, max_latency_ms: 100.0, max_jitter_ms: 10.0 }
+    preferred_wan: null
+    migrate_on_degradation: true
+
+  - name: web
+    traffic_class: web
+    weights: { latency: 0.50, jitter: 0.10, loss: 0.30, cost: 0.10 }
+    hard_limits: { max_loss_pct: 10.0, max_latency_ms: 300.0 }
+    preferred_wan: null
+    migrate_on_degradation: true
+
+  - name: bulk
+    traffic_class: bulk
+    weights: { latency: 0.10, jitter: 0.05, loss: 0.20, cost: 0.65 }
+    hard_limits: { max_loss_pct: 20.0 }
+    preferred_wan: wan2
+    migrate_on_degradation: false
+
+  - name: other
+    traffic_class: other
+    weights: { latency: 0.30, jitter: 0.10, loss: 0.30, cost: 0.30 }
+    hard_limits: {}
+    preferred_wan: null
+    migrate_on_degradation: false
+
+ml:
+  enabled: true
+  prediction_horizon_seconds: 30
+  anomaly_threshold: 0.09          # calibrado con train_model.py: score normal max ≈ +0.07,
+                                   # rampas de degradación ≥ +0.11 → 0.09 separa ambos sin
+                                   # falsos positivos ni negativos (el script imprime esto)
+  consecutive_alerts: 3            # ciclos consecutivos anómalos antes de migrar
+  feature_window: 20
+  model_path: "/models/predictor.pkl"
+  scaler_path: "/models/scaler.pkl"
+  # retrain_interval_minutes: 30   # ELIMINADO: reentrenamiento online fuera de alcance.
+  #                                # El modelo se entrena OFFLINE con train_model.py y se
+  #                                # carga al inicio. Reentrenar en caliente durante una demo
+  #                                # de 15 min nunca ocurre y complica el ciclo de vida.
+  # contamination: 0.15            # movido a train_model.py (es un parámetro de entrenamiento,
+  #                                # no de inferencia; no pertenece a la config del orquestador)
+
+api:
+  host: "0.0.0.0"
+  port: 8080
+  cors_origins:
+    - "http://localhost:3000"
+    - "http://localhost:5173"
+
+traffic_classification:
+  voip_ports_udp: [5060, 5061, 4569]
+  voip_rtp_range_start: 10000
+  voip_rtp_range_end: 20000
+  web_ports_tcp: [80, 443, 8080, 8443]
+  bulk_ports_tcp: [21, 22, 873, 9000]
+  # bulk_min_duration_seconds: 5   # ELIMINADO: reclasificar un flujo vivo implica
+  #                                # re-marcarlo y moverlo de WAN a mitad de conexión
+  #                                # (rompe la sesión). Clasificamos solo por puertos en
+  #                                # el primer paquete; el generador de tráfico usa
+  #                                # puertos conocidos, la heurística nunca aportaba.
